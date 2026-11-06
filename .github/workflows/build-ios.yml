@@ -1,0 +1,181 @@
+name: Muguet iOS Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "Upstream c22dev/muguet commit, tag, or branch (default is pinned)"
+        required: true
+        type: string
+        default: "728c195ab02c746a1f2d626238bfe030b2f561fb"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: muguet-ios-build
+  cancel-in-progress: false
+
+jobs:
+  build-ios:
+    name: Build iOS IPA (ARM64)
+    runs-on: macos-26
+    timeout-minutes: 360
+    env:
+      CARGO_BUILD_JOBS: "1"
+      CARGO_INCREMENTAL: "0"
+      BUNDLE_ID: "com.yanyantukebo1224.muguet"
+      FREE: "1"
+      RUST_BACKTRACE: "1"
+
+    steps:
+      - name: Check out build configuration
+        uses: actions/checkout@v4
+
+      - name: Initialize output directory
+        shell: bash
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/output"
+          : > "$GITHUB_WORKSPACE/output/build.log"
+          : > "$GITHUB_WORKSPACE/output/build-manifest.txt"
+
+      - name: Validate required secrets
+        shell: bash
+        env:
+          TS_OAUTH_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          TS_OAUTH_SECRET: ${{ secrets.TS_OAUTH_SECRET }}
+          MUGUET_GAME_WASM_URL: ${{ secrets.MUGUET_GAME_WASM_URL }}
+          MUGUET_GAME_WASM_SHA256: ${{ secrets.MUGUET_GAME_WASM_SHA256 }}
+        run: |
+          set -euo pipefail
+          for name in TS_OAUTH_CLIENT_ID TS_OAUTH_SECRET MUGUET_GAME_WASM_URL MUGUET_GAME_WASM_SHA256; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Missing repository secret: $name"
+              exit 1
+            fi
+          done
+          if ! [[ "$MUGUET_GAME_WASM_SHA256" =~ ^[0-9a-fA-F]{64}$ ]]; then
+            echo "::error::MUGUET_GAME_WASM_SHA256 must be a 64-character SHA-256 hex digest."
+            exit 1
+          fi
+          case "$MUGUET_GAME_WASM_URL" in
+            https://*) ;;
+            *) echo "::error::MUGUET_GAME_WASM_URL must use HTTPS (Tailscale Serve URL)."; exit 1 ;;
+          esac
+
+      - name: Join private Tailscale network
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+
+      - name: Download and verify game code
+        shell: bash
+        env:
+          MUGUET_GAME_WASM_URL: ${{ secrets.MUGUET_GAME_WASM_URL }}
+          MUGUET_GAME_WASM_SHA256: ${{ secrets.MUGUET_GAME_WASM_SHA256 }}
+        run: |
+          set -euo pipefail
+          echo "Downloading private game.wasm through the tailnet..."
+          curl --silent --show-error --fail --location \
+            --retry 3 --retry-delay 5 --connect-timeout 30 --max-time 1800 \
+            "$MUGUET_GAME_WASM_URL" -o "$GITHUB_WORKSPACE/game.wasm"
+          echo "$MUGUET_GAME_WASM_SHA256  $GITHUB_WORKSPACE/game.wasm" | shasum -a 256 -c -
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("game.wasm")
+          with p.open("rb") as f:
+              magic = f.read(4)
+          if magic != b"\\x00asm":
+              raise SystemExit("Downloaded file is not a WebAssembly module (bad magic header).")
+          if p.stat().st_size < 8:
+              raise SystemExit("Downloaded WebAssembly module is unexpectedly small.")
+          print(f"Validated WebAssembly module: {p.stat().st_size:,} bytes")
+          PY
+
+      - name: Check out upstream Muguet source
+        shell: bash
+        env:
+          UPSTREAM_REF: ${{ inputs.upstream_ref }}
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none https://github.com/c22dev/muguet.git upstream
+          git -C upstream checkout --detach "$UPSTREAM_REF"
+          echo "UPSTREAM_COMMIT=$(git -C upstream rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "UPSTREAM_REF=$UPSTREAM_REF" >> "$GITHUB_ENV"
+
+      - name: Install Apple and Rust build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          XCODE_MAJOR="$(xcodebuild -version | awk '/^Xcode/ { split($2, v, "."); print v[1] }')"
+          if [ "${XCODE_MAJOR:-0}" -lt 26 ]; then
+            echo "::error::Muguet requires Xcode 26 or newer."
+            exit 1
+          fi
+          xcodebuild -showsdks | grep -q iphoneos
+
+          if ! command -v xcodegen >/dev/null 2>&1 || ! command -v wasm-opt >/dev/null 2>&1; then
+            brew install xcodegen binaryen
+          fi
+
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustup toolchain install stable --profile minimal
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup target add aarch64-apple-ios --toolchain 1.98.1
+          rustc +stable --version
+          rustc +1.98.1 --version
+          xcodegen --version
+          wasm-opt --version
+
+      - name: Build Muguet for iOS
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd upstream
+          mkdir -p build
+          ./make-ios.sh "$GITHUB_WORKSPACE/game.wasm" --ipa 2>&1 | tee "$GITHUB_WORKSPACE/output/build.log"
+          test -s build/Muguet.ipa
+          cp build/Muguet.ipa "$GITHUB_WORKSPACE/output/Muguet.ipa"
+          unzip -t "$GITHUB_WORKSPACE/output/Muguet.ipa" >/dev/null
+          IPA_SHA="$(shasum -a 256 "$GITHUB_WORKSPACE/output/Muguet.ipa" | awk '{print $1}')"
+          GAME_SHA="$(shasum -a 256 "$GITHUB_WORKSPACE/game.wasm" | awk '{print $1}')"
+          {
+            echo "Upstream repository: https://github.com/c22dev/muguet"
+            echo "Upstream ref: $UPSTREAM_REF"
+            echo "Upstream commit: $UPSTREAM_COMMIT"
+            echo "Xcode: $(xcodebuild -version | tr '\n' ' ')"
+            echo "Rust stable: $(rustc +stable --version)"
+            echo "Rust iOS toolchain: $(rustc +1.98.1 --version)"
+            echo "Target: aarch64-apple-ios"
+            echo "Bundle ID: $BUNDLE_ID"
+            echo "Game WASM SHA-256: $GAME_SHA"
+            echo "IPA SHA-256: $IPA_SHA"
+            echo "Signing: ad-hoc/unsigned IPA for AltStore re-signing"
+          } | tee "$GITHUB_WORKSPACE/output/build-manifest.txt"
+
+      - name: Upload IPA artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Muguet-iOS-IPA
+          path: output/Muguet.ipa
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build logs and manifest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Muguet-build-logs
+          path: |
+            output/build.log
+            output/build-manifest.txt
+          if-no-files-found: warn
+          retention-days: 30
